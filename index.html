@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>HELIOS FURY — orbit of a dying star</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #030208; }
+  body { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; user-select: none; -webkit-user-select: none; }
+  #stage { position: fixed; inset: 0; cursor: crosshair; touch-action: none; }
+  #stage canvas { display: block; opacity: 0; transition: opacity 1.6s ease; }
+  #stage.lit canvas { opacity: 1; }
+
+  .hud { position: fixed; z-index: 10; pointer-events: none; transition: opacity 0.9s ease; }
+  #hud-root.dim .hud { opacity: 0.22; }
+  #hud-root.hidden .hud { opacity: 0; }
+
+  #title { top: 28px; left: 32px; }
+  #title h1 {
+    font-size: 15px; font-weight: 800; letter-spacing: 0.42em;
+    color: #ffb066; text-shadow: 0 0 18px rgba(255, 110, 30, 0.55);
+  }
+  #title p { margin-top: 6px; font-size: 10px; letter-spacing: 0.18em; color: #8a6f58; }
+
+  #stats { top: 28px; right: 32px; text-align: right; font-size: 10px; letter-spacing: 0.14em; color: #6f5a48; }
+  #stats b { color: #c89058; font-weight: 600; }
+
+  #badge {
+    top: 64px; right: 32px; font-size: 9px; letter-spacing: 0.3em; color: #ffb066;
+    border: 1px solid rgba(255, 140, 60, 0.4); padding: 4px 8px; border-radius: 3px;
+    opacity: 0; transition: opacity 0.5s ease;
+  }
+  #badge.on { opacity: 0.9; }
+
+  #hints { bottom: 24px; left: 0; right: 0; display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; }
+  #hints span { font-size: 9.5px; letter-spacing: 0.12em; color: #71594a; }
+  #hints b { color: #b9824f; font-weight: 600; }
+
+  #boot {
+    position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+    background: #030208; color: #8a6f58; font-size: 10px; letter-spacing: 0.5em;
+    transition: opacity 1.4s ease; pointer-events: none;
+  }
+  #boot.off { opacity: 0; }
+
+  #fatal {
+    position: fixed; inset: 0; z-index: 30; display: none; align-items: center; justify-content: center;
+    background: #050308; color: #d09060; font-size: 12px; letter-spacing: 0.1em; text-align: center;
+    padding: 40px; line-height: 2;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="hud-root">
+  <div class="hud" id="title">
+    <h1>HELIOS FURY</h1>
+    <p>orbit of a dying star</p>
+  </div>
+  <div class="hud" id="stats"><b id="fps">--</b> fps · <span id="ql">Q0</span></div>
+  <div class="hud" id="badge">CINEMATIC</div>
+  <div class="hud" id="hints">
+    <span><b>drag</b> orbit</span>
+    <span><b>scroll</b> dolly</span>
+    <span><b>hover</b> scorch</span>
+    <span><b>click</b> detonate</span>
+    <span><b>hold</b> charge</span>
+    <span><b>space</b> flare</span>
+    <span><b>1·2·3</b> star class</span>
+    <span><b>h</b> hud</span>
+  </div>
+</div>
+<div id="boot">IGNITING</div>
+<div id="fatal"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+/* ====================================================================
+   0. FATAL OVERLAY
+==================================================================== */
+const fatal = (msg) => {
+  const el = document.getElementById('fatal');
+  el.style.display = 'flex';
+  el.textContent = msg;
+};
+window.addEventListener('error', (e) => {
+  if (!booted) fatal('HELIOS FURY failed to ignite — ' + (e.message || 'unknown error'));
+});
+let booted = false;
+
+/* ====================================================================
+   1. GLSL LIBRARY — shared noise chunks (Ashima/stegu simplex)
+==================================================================== */
+const GLSL_COMMON = /* glsl */`
+float mod289(float x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec3  mod289(vec3 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4  mod289(vec4 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float permute(float x){ return mod289(((x * 34.0) + 1.0) * x); }
+vec4  permute(vec4 x){ return mod289(((x * 34.0) + 1.0) * x); }
+float taylorInvSqrt(float r){ return 1.79284291400159 - 0.85373472095314 * r; }
+vec4  taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+`;
+
+const GLSL_SNOISE3 = /* glsl */`
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+            i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot(m * m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+`;
+
+const GLSL_SNOISE4 = /* glsl */`
+vec4 grad4(float j, vec4 ip){
+  const vec4 ones = vec4(1.0, 1.0, 1.0, -1.0);
+  vec4 p, s;
+  p.xyz = floor(fract(vec3(j) * ip.xyz) * 7.0) * ip.z - 1.0;
+  p.w = 1.5 - dot(abs(p.xyz), ones.xyz);
+  s = vec4(lessThan(p, vec4(0.0)));
+  p.xyz = p.xyz + (s.xyz * 2.0 - 1.0) * s.www;
+  return p;
+}
+float snoise(vec4 v){
+  const vec4 C = vec4(0.138196601125011, 0.276393202250021, 0.414589803375032, -0.447213595499958);
+  const float F4 = 0.309016994374947451;
+  vec4 i  = floor(v + dot(v, vec4(F4)));
+  vec4 x0 = v - i + dot(i, C.xxxx);
+  vec4 i0;
+  vec3 isX = step(x0.yzw, x0.xxx);
+  vec3 isYZ = step(x0.zww, x0.yyz);
+  i0.x = isX.x + isX.y + isX.z;
+  i0.yzw = 1.0 - isX;
+  i0.y += isYZ.x + isYZ.y;
+  i0.zw += 1.0 - isYZ.xy;
+  i0.z += isYZ.z;
+  i0.w += 1.0 - isYZ.z;
+  vec4 i3 = clamp(i0, 0.0, 1.0);
+  vec4 i2 = clamp(i0 - 1.0, 0.0, 1.0);
+  vec4 i1 = clamp(i0 - 2.0, 0.0, 1.0);
+  vec4 x1 = x0 - i1 + C.xxxx;
+  vec4 x2 = x0 - i2 + C.yyyy;
+  vec4 x3 = x0 - i3 + C.zzzz;
+  vec4 x4 = x0 + C.wwww;
+  i = mod289(i);
+  float j0 = permute(permute(permute(permute(i.w) + i.z) + i.y) + i.x);
+  vec4 j1 = permute(permute(permute(permute(
+             i.w + vec4(i1.w, i2.w, i3.w, 1.0))
+           + i.z + vec4(i1.z, i2.z, i3.z, 1.0))
+           + i.y + vec4(i1.y, i2.y, i3.y, 1.0))
+           + i.x + vec4(i1.x, i2.x, i3.x, 1.0));
+  vec4 ip = vec4(1.0/294.0, 1.0/49.0, 1.0/7.0, 0.0);
+  vec4 p0 = grad4(j0,   ip);
+  vec4 p1 = grad4(j1.x, ip);
+  vec4 p2 = grad4(j1.y, ip);
+  vec4 p3 = grad4(j1.z, ip);
+  vec4 p4 = grad4(j1.w, ip);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  p4 *= taylorInvSqrt(dot(p4,p4));
+  vec3 m0 = max(0.6 - vec3(dot(x0,x0), dot(x1,x1), dot(x2,x2)), 0.0);
+  vec2 m1 = max(0.6 - vec2(dot(x3,x3), dot(x4,x4)), 0.0);
+  m0 = m0 * m0;
+  m1 = m1 * m1;
+  return 49.0 * (dot(m0 * m0, vec3(dot(p0,x0), dot(p1,x1), dot(p2,x2)))
+               + dot(m1 * m1, vec2(dot(p3,x3), dot(p4,x4))));
+}
+`;
+
+// Traveling shockwave ring — shared by star vertex + fragment so the
+// displacement bulge and the re-melt glow stay in perfect sync.
+const GLSL_SHOCK = /* glsl */`
+float shockRing(vec3 p, vec4 s){
+  if (s.w > 8.0) return 0.0;
+  float d = distance(p, s.xyz);
+  float front = s.w * 1.9;
+  return smoothstep(0.16, 0.0, abs(d - front)) * exp(-s.w * 2.2);
+}
+`;
+
+/* ====================================================================
+   2. RENDERER / SCENE / CAMERA
+==================================================================== */
+const stage = document.getElementById('stage');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+} catch (e) {
+  fatal('WebGL is unavailable in this browser.');
+  throw e;
+}
+if (!renderer.capabilities.isWebGL2) {
+  fatal('HELIOS FURY needs WebGL2. Try a current Chrome / Firefox / Safari.');
+  throw new Error('WebGL2 required');
+}
+renderer.toneMapping = THREE.NoToneMapping; // HDR flows raw through the chain; ACES lives in the grade pass
+renderer.setSize(innerWidth, innerHeight);
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 200);
+
+/* ====================================================================
+   3. STATE — palettes, director, input
+==================================================================== */
+// star classes = one well-tuned warm palette + a luma-preserving hue rotation of the
+// emissive (W3C hue-rotate matrix): whites stay white, vein dynamics survive exactly
+function hueMatrix(deg){
+  const c = Math.cos(deg * Math.PI / 180), s = Math.sin(deg * Math.PI / 180);
+  return [
+    0.213 + 0.787 * c - 0.213 * s, 0.715 - 0.715 * c - 0.715 * s, 0.072 - 0.072 * c + 0.787 * s,
+    0.213 - 0.213 * c + 0.143 * s, 0.715 + 0.285 * c + 0.140 * s, 0.072 - 0.072 * c - 0.283 * s,
+    0.213 - 0.213 * c - 0.787 * s, 0.715 - 0.715 * c + 0.715 * s, 0.072 + 0.928 * c + 0.072 * s,
+  ];
+}
+const PALETTES = [
+  { hue: hueMatrix(0),   star: new THREE.Color(0xff6b1a), crust: new THREE.Color(0x1a0d08) },
+  { hue: hueMatrix(195), star: new THREE.Color(0x7da7ff), crust: new THREE.Color(0x0a1020) },
+  { hue: hueMatrix(95),  star: new THREE.Color(0x7dff9a), crust: new THREE.Color(0x07120a) },
+];
+const pal = {
+  hue: hueMatrix(0),
+  star: PALETTES[0].star.clone(),
+  crust: PALETTES[0].crust.clone(),
+  target: 0,
+};
+
+const S = {
+  simTime: 0,            // shader clock (slow-mo bends this one)
+  timescale: 1,
+  slowmoHold: 0,
+  birth: 0,              // 0→1 ignition sequence
+  activity: 0.55,
+  dragEnergy: 0,
+  charge: 0,             // press-and-hold
+  chargeHeld: false,
+  flareAmp: 0, flareT: 99, flareEnv: 0,
+  shakeAmp: 0,
+  caKick: 0,
+  wash: 0, washDelay: -1, washAmp: 0,
+  lastFlare: -99,        // auto-CME cooldown
+  lastInput: 0,
+  cinematic: false, cineT: 0, cineKilled: -1e9,
+  ghost: 0,              // ghost-stir blend 0..1
+  fissureNext: 30, fissureT: -99, fissureN: new THREE.Vector3(0, 1, 0), fissureR: new THREE.Vector3(1, 0, 0),
+  igniteOrigin: new THREE.Vector3().randomDirection(),
+};
+
+const orbit = {
+  theta: 0.6, phi: 1.25,
+  vTheta: 0, vPhi: 0,
+  radius: 3.2, targetRadius: 3.2,
+};
+
+const heatPts = Array.from({ length: 4 }, () => ({ pos: new THREE.Vector3(0, 0, 1.5), str: 0 }));
+const shockSlots = [new THREE.Vector4(0, 0, 0, 99), new THREE.Vector4(0, 0, 0, 99), new THREE.Vector4(0, 0, 0, 99)];
+
+/* ====================================================================
+   4. THE STAR — displaced ridged-multifractal crust
+==================================================================== */
+const starUniforms = {
+  uTime:      { value: 0 },
+  uAmp:       { value: 0.085 },
+  uBreath:    { value: 1 },
+  uActivity:  { value: 0.55 },
+  uFlare:     { value: 0 },
+  uDriftZ:    { value: 0 },
+  uCrust:     { value: pal.crust },
+  uHeat:      { value: heatPts.map(() => new THREE.Vector4(0, 0, 1.5, 0)) },
+  uShock:     { value: shockSlots },
+  uFissure:   { value: new THREE.Vector4(0, 1, 0, 0) },
+  uFissureRef:{ value: new THREE.Vector4(1, 0, 0, 0) },
+  uIgnite:    { value: new THREE.Vector4(S.igniteOrigin.x, S.igniteOrigin.y, S.igniteOrigin.z, 0) },
+  uHue:       { value: new THREE.Matrix3() },
+};
+
+const starVert = GLSL_COMMON + GLSL_SNOISE4 + GLSL_SHOCK + /* glsl */`
+uniform float uTime, uAmp, uBreath, uActivity;
+uniform vec4 uShock[3];
+varying vec3 vPos;
+varying vec3 vN;
+varying vec3 vWorld;
+varying float vTemp;
+varying float vAO;
+
+// Domain-warped ridged multifractal. Returns (full height, first-two-octave height)
+// so the fragment stage can derive slope AO for free.
+vec2 heightField2(vec3 p, float t){
+  vec3 q = p + 0.35 * vec3(
+    snoise(vec4(p * 1.1,        t * 0.10)),
+    snoise(vec4(p * 1.1 + 17.0, t * 0.10)),
+    snoise(vec4(p * 1.1 + 43.0, t * 0.10)));
+  float sum = 0.0, freq = 2.3, amp = 0.5, prev = 1.0, low = 0.0;
+  for (int i = 0; i < 4; i++){
+    float n = snoise(vec4(q * freq, t * 0.16 + float(i) * 7.3));
+    float r = 1.0 - abs(n);
+    r = r * r;
+    sum += r * amp * prev;
+    prev = r;
+    if (i == 1) low = sum;
+    freq *= 2.17;
+    amp *= 0.52;
+  }
+  return vec2(sum, low);
+}
+
+float displaceOf(vec3 p, float h){
+  float d = uAmp * h;
+  d += uBreath * 0.012 * sin(uTime * 0.6 + h * 4.0);
+  for (int i = 0; i < 3; i++) d += 0.05 * shockRing(p, uShock[i]);
+  return d;
+}
+
+void main(){
+  vec3 p = normalize(position);
+  vec2 hh = heightField2(p, uTime);
+  vec3 np = p * (1.0 + displaceOf(p, hh.x));
+
+  // analytic displaced normal: 3-tap finite difference in the sphere tangent frame
+  vec3 t1 = normalize(abs(p.y) < 0.95 ? cross(p, vec3(0.0, 1.0, 0.0)) : cross(p, vec3(1.0, 0.0, 0.0)));
+  vec3 b1 = normalize(cross(p, t1));
+  float e = 0.012;
+  vec3 pT = normalize(p + t1 * e);
+  vec3 pB = normalize(p + b1 * e);
+  vec3 PT = pT * (1.0 + displaceOf(pT, heightField2(pT, uTime).x));
+  vec3 PB = pB * (1.0 + displaceOf(pB, heightField2(pB, uTime).x));
+  vec3 nrm = normalize(cross(PT - np, PB - np));
+  if (dot(nrm, p) < 0.0) nrm = -nrm;
+
+  vTemp = hh.x;
+  vAO = clamp(1.0 - 1.5 * (hh.x - hh.y), 0.4, 1.0);
+  vPos = p;
+  vN = nrm;
+  vec4 w = modelMatrix * vec4(np, 1.0);
+  vWorld = w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}
+`;
+
+const starFrag = GLSL_COMMON + GLSL_SNOISE4 + GLSL_SHOCK + /* glsl */`
+uniform float uTime, uActivity, uFlare, uDriftZ;
+uniform vec3 uCrust;
+uniform vec4 uHeat[4];
+uniform vec4 uShock[3];
+uniform vec4 uFissure;     // xyz plane normal, w sweep progress 0..1
+uniform vec4 uFissureRef;  // xyz reference dir in plane, w glow
+uniform vec4 uIgnite;      // xyz origin, w radius
+uniform mat3 uHue;         // star-class hue rotation, luma-preserving
+varying vec3 vPos;
+varying vec3 vN;
+varying vec3 vWorld;
+varying float vTemp;
+varying float vAO;
+
+// monotonic blackbody ramp: black -> red -> orange -> yellow -> white-hot.
+// (a cosine palette here had negative/blue valleys mid-ramp that survived into bloom)
+vec3 heatRamp(float x){
+  x = clamp(x, 0.0, 1.0);
+  vec3 c = vec3(
+    pow(smoothstep(0.0, 0.35, x), 0.8),
+    smoothstep(0.25, 0.75, x),
+    smoothstep(0.55, 1.0, x));
+  c.b += uDriftZ * 2.0 * x; // activity peaks pull the hottest light toward blue-white
+  return c * (0.25 + 0.75 * x) * 1.4;
+}
+
+// A fissure tears along a great circle: heat band near the plane,
+// revealed by sweep angle, faded by the glow envelope.
+float fissureHeat(vec3 p, vec4 fis, vec4 fref){
+  if (fref.w < 0.004) return 0.0;
+  float band = smoothstep(0.06, 0.0, abs(dot(p, fis.xyz)));
+  if (band < 0.001) return 0.0;
+  vec3 pp = p - fis.xyz * dot(p, fis.xyz);
+  float pl = length(pp);
+  if (pl < 1e-3) return 0.0;
+  vec3 cdir = pp / pl;
+  float ang = atan(dot(cross(fis.xyz, fref.xyz), cdir), dot(fref.xyz, cdir)); // -pi..pi
+  float na = (ang + 3.14159265) / 6.2831853;
+  float sweep = smoothstep(fis.w, fis.w - 0.07, na);
+  return band * sweep * fref.w;
+}
+
+void main(){
+  vec3 p = vPos;
+  vec3 V = normalize(cameraPosition - vWorld);
+  vec3 N = normalize(vN);
+  float F = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+  // vein domain — independently warped so cracks slither across the crust
+  vec3 q2 = p * 2.6 + 0.4 * vec3(
+    snoise(vec4(p * 1.8 + 3.1,  uTime * 0.12)),
+    snoise(vec4(p * 1.8 + 7.7,  uTime * 0.12)),
+    snoise(vec4(p * 1.8 + 13.9, uTime * 0.12)));
+  float vn = snoise(vec4(q2, uTime * 0.18));
+  float veins = pow(1.0 - abs(vn), 12.0);
+  veins = smoothstep(0.4, 0.95, veins);
+
+  // traveling pulse: light visibly FLOWS through the vein network
+  vec3 pd = normalize(vec3(sin(uTime * 0.21), 0.45, cos(uTime * 0.21)));
+  float flow = 0.7 + 0.6 * sin(dot(p, pd) * 5.0 - uTime * 2.6 + vn * 3.0);
+
+  // fine per-fragment grain the vertex stage can't resolve
+  float fine = 0.6 * snoise(vec4(q2 * 2.1, uTime * 0.5)) + 0.3 * snoise(vec4(q2 * 4.4, uTime * 0.7));
+
+  float heatSum = 0.0;
+  for (int i = 0; i < 4; i++){
+    vec3 hp = uHeat[i].xyz;
+    heatSum += uHeat[i].w * 0.42 * exp(-dot(p - hp, p - hp) * 22.0);
+  }
+  float shockSum = 0.0;
+  for (int i = 0; i < 3; i++) shockSum += shockRing(p, uShock[i]);
+  float fiss = fissureHeat(p, uFissure, uFissureRef);
+  float ign = smoothstep(uIgnite.w, uIgnite.w - 0.45, distance(p, uIgnite.xyz));
+
+  float T = clamp(vTemp * 0.8 + fine * 0.45 + heatSum + shockSum * 0.7 + fiss * 1.2 + uActivity * 0.06 - 0.15, 0.0, 1.5);
+
+  // micro relief from screen-space derivatives, faded at the limb to avoid sparkle
+  vec2 g = vec2(dFdx(fine), dFdy(fine));
+  float mic = 1.0 - clamp(length(g) * 2.5, 0.0, 0.45) * (1.0 - F);
+
+  vec3 crust = uCrust * vAO * mic;
+  float veinGlow = veins * flow * ign;
+  vec3 emis = heatRamp(clamp(T, 0.0, 1.2) * 0.85)
+            * (0.035 + 3.6 * veinGlow + 0.8 * pow(clamp(T - 0.28, 0.0, 1.0), 4.0))
+            * (0.25 + 0.75 * ign);
+  emis += heatRamp(0.55 + 0.25 * uFlare) * F * (0.30 + 0.7 * uActivity + 0.7 * uFlare) * (0.15 + 0.85 * ign);
+  emis += vec3(1.0, 0.95, 0.82) * (shockSum * 1.0 + fiss * 1.4);
+  emis = max(uHue * emis, vec3(0.0));
+
+  vec3 col = crust + emis;
+
+  // thin-film sheen on cooling slag, fwidth-faded so it can't shimmer-alias.
+  // derivatives stay in uniform control flow — only the cheap math is branched
+  float cool = smoothstep(0.22, 0.05, T);
+  float thick = fine * 1.5 + F * 2.0 + 1.5;
+  float wph = fwidth(thick) * 7.0;
+  if (cool > 0.002){
+    vec3 irid = 0.5 + 0.5 * cos(vec3(7.0, 5.7, 4.6) * thick + vec3(0.0, 2.1, 4.2));
+    irid = mix(vec3(dot(irid, vec3(0.333))), irid, 0.55); // restrained, oily — not rainbow confetti
+    float fadeA = 1.0 - smoothstep(1.6, 3.2, wph);
+    col += irid * (cool * F * F * 0.10 * fadeA); // F^2: strictly grazing-angle sheen
+  }
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// PolyhedronGeometry is non-indexed triangle soup (564k VS invocations); the star shader
+// only reads `position`, so drop uv/normal and weld into an indexed ~94k-vertex mesh.
+const starGeoRaw = new THREE.IcosahedronGeometry(1, 96);
+starGeoRaw.deleteAttribute('uv');
+starGeoRaw.deleteAttribute('normal');
+const starGeo = mergeVertices(starGeoRaw);
+const starMat = new THREE.ShaderMaterial({ uniforms: starUniforms, vertexShader: starVert, fragmentShader: starFrag });
+const star = new THREE.Mesh(starGeo, starMat);
+star.frustumCulled = false;
+scene.add(star);
+
+/* ====================================================================
+   5. CORONA — fake-volumetric plasma shell (BackSide, additive)
+==================================================================== */
+const coronaUniforms = {
+  uTime:      { value: 0 },
+  uActivity:  { value: 0.55 },
+  uFlare:     { value: 0 },
+  uStarColor: { value: pal.star },
+  uSamples:   { value: 4 },
+  uBirth:     { value: 0 },
+};
+const coronaVert = /* glsl */`
+varying vec3 vWorld;
+void main(){
+  vec4 w = modelMatrix * vec4(position, 1.0);
+  vWorld = w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}
+`;
+const coronaFrag = GLSL_COMMON + GLSL_SNOISE3 + /* glsl */`
+uniform float uTime, uActivity, uFlare, uSamples, uBirth;
+uniform vec3 uStarColor;
+varying vec3 vWorld;
+
+mat3 rotY(float a){ float c = cos(a), s = sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+mat3 rotX(float a){ float c = cos(a), s = sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+
+void main(){
+  vec3 ro = cameraPosition;
+  vec3 rd = normalize(vWorld - cameraPosition);
+  float tca = dot(-ro, rd);
+  vec3 cp = ro + rd * tca;
+  float b = length(cp);
+  float limb = b - 1.0;
+  float fall = exp(-max(limb, 0.0) * 4.0) * smoothstep(-0.25, 0.05, limb) * step(0.0, tca);
+  if (fall < 0.004){ gl_FragColor = vec4(0.0); return; }
+
+  vec3 dirC = cp / max(b, 1e-4);
+  // precessing rotation so the corona slowly tumbles, never loops
+  mat3 R = rotY(uTime * 0.05) * rotX(sin(uTime * 0.033 + 1.7) * 0.6);
+  vec3 sd = R * dirC;
+
+  float streak = 0.0, wsum = 0.0;
+  for (int i = 0; i < 4; i++){
+    if (float(i) >= uSamples) break;
+    float rr = 1.0 + float(i) * 0.18 + max(limb, 0.0) * 0.5;
+    float n = 1.0 - abs(snoise(sd * 3.2 * rr + vec3(0.0, 0.0, uTime * 0.12)));
+    n = pow(n, 3.0);
+    float w = exp(-float(i) * 0.55);
+    streak += n * w;
+    wsum += w;
+  }
+  streak /= wsum;
+
+  float inten = fall * (0.16 + 1.1 * streak) * (0.30 + 0.55 * uActivity) * (1.0 + 1.2 * uFlare) * mix(0.05, 1.0, uBirth);
+  // uStarColor is already the class color — no hue rotation here or it double-applies
+  vec3 col = mix(uStarColor, vec3(1.0, 0.97, 0.9), streak * 0.35 * (1.0 + uFlare)) * inten;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+const corona = new THREE.Mesh(
+  new THREE.SphereGeometry(2.6, 48, 48),
+  new THREE.ShaderMaterial({
+    uniforms: coronaUniforms, vertexShader: coronaVert, fragmentShader: coronaFrag,
+    side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending,
+    depthWrite: false, depthTest: true,
+  })
+);
+corona.frustumCulled = false;
+scene.add(corona);
+
+/* ====================================================================
+   6. EMBERS — 4000 GPU particles, zero CPU per-frame work
+==================================================================== */
+const EMBERS = 4000;
+const emberUniforms = {
+  uTime:      { value: 0 },
+  uBirth:     { value: 0 },
+  uActivity:  { value: 0.55 },
+  uSizeBase:  { value: 7 },
+  uStarColor: { value: pal.star },
+  uBurst:     { value: new THREE.Vector4(0, 0, 1, -100) }, // xyz origin, w start time
+  uBurstFrac: { value: 0 },
+};
+const emberVert = GLSL_COMMON + GLSL_SNOISE3 + /* glsl */`
+attribute vec4 aSeed;
+uniform float uTime, uBirth, uActivity, uSizeBase, uBurstFrac;
+uniform vec4 uBurst;
+uniform vec3 uStarColor;
+varying vec3 vCol;
+
+void main(){
+  vec3 dir = normalize(position);
+  float lifeDur = mix(3.0, 7.0, aSeed.y);
+  float lp = fract(uTime / lifeDur + aSeed.x);
+
+  float burstT = uTime - uBurst.w;
+  bool isB = (aSeed.z < uBurstFrac) && burstT >= 0.0 && burstT < 2.2;
+  vec3 baseDir = dir;
+  if (isB){
+    lp = burstT / 2.2;
+    baseDir = normalize(uBurst.xyz + (vec3(aSeed.x, aSeed.y, aSeed.w) - 0.5) * 0.7);
+  }
+
+  float ease = lp * lp * (3.0 - 2.0 * lp);
+  float r = 1.03 + ease * mix(0.5, 1.6, aSeed.w) * (isB ? 1.5 : 1.0);
+  vec3 p = baseDir * r;
+  p += 0.22 * lp * vec3(
+    snoise(baseDir * 2.1 + uTime * 0.25),
+    snoise(baseDir * 2.1 + 11.0 + uTime * 0.25),
+    snoise(baseDir * 2.1 + 23.0 + uTime * 0.25));
+
+  // birth: embers spiral INWARD — accretion igniting the star
+  if (uBirth < 1.0){
+    float bi = clamp(uBirth * 1.15 - aSeed.x * 0.15, 0.0, 1.0);
+    float ang = (1.0 - bi) * (3.0 + aSeed.y * 5.0);
+    vec3 d2 = vec3(cos(ang) * dir.x - sin(ang) * dir.z, dir.y, sin(ang) * dir.x + cos(ang) * dir.z);
+    p = d2 * mix(5.5, 1.04, bi);
+    lp = 0.5;
+  }
+
+  float fade = sin(min(lp, 1.0) * 3.14159);
+  float heat = (isB ? 1.0 : 0.7) * fade * (0.5 + 0.5 * uActivity);
+  vCol = mix(uStarColor, vec3(1.0, 0.93, 0.75), heat * 0.55) * heat * 1.6;
+
+  vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  gl_PointSize = clamp(uSizeBase * (1.0 + aSeed.w * 1.4) * (isB ? 1.6 : 1.0) * fade / max(-mv.z, 0.1), 1.0, 28.0);
+  gl_Position = projectionMatrix * mv;
+}
+`;
+const emberFrag = /* glsl */`
+varying vec3 vCol;
+void main(){
+  float d = length(gl_PointCoord - 0.5);
+  float a = smoothstep(0.5, 0.08, d);
+  a *= a;
+  gl_FragColor = vec4(vCol * a, 1.0); // alpha=1: additive blend is (SRC_ALPHA, ONE), avoid a^3 falloff
+}
+`;
+{
+  const pos = new Float32Array(EMBERS * 3);
+  const seed = new Float32Array(EMBERS * 4);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < EMBERS; i++){
+    v.randomDirection();
+    pos.set([v.x, v.y, v.z], i * 3);
+    seed.set([Math.random(), Math.random(), Math.random(), Math.random()], i * 4);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
+  const m = new THREE.ShaderMaterial({
+    uniforms: emberUniforms, vertexShader: emberVert, fragmentShader: emberFrag,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const points = new THREE.Points(g, m);
+  points.frustumCulled = false;
+  scene.add(points);
+}
+
+/* ====================================================================
+   7. PROMINENCES — 6 static tubes, all motion lives in uniforms
+==================================================================== */
+const ARC_COUNT = 6;
+const arcSlots = [];
+const promVert = GLSL_COMMON + GLSL_SNOISE3 + /* glsl */`
+uniform vec4 uQuat;
+uniform float uLife, uHeight, uSeed, uTime;
+varying vec2 vUvT;
+vec3 qrot(vec4 q, vec3 v){ return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+void main(){
+  vUvT = uv;
+  float r = length(position);
+  vec3 dir = position / max(r, 1e-4);
+  float grow = smoothstep(0.0, 0.22, uLife);
+  grow = 1.0 - pow(1.0 - grow, 3.0);
+  float snap = 1.0 - smoothstep(0.86, 1.0, uLife);
+  float k = uHeight * grow * snap;
+  float hAmt = max(r - 1.0, 0.0);
+  vec3 p = dir * (1.0 + (r - 1.0) * k);
+  p += hAmt * 0.12 * (0.4 + 0.6 * smoothstep(0.6, 1.0, uLife)) * vec3(
+    snoise(position * 2.0 + uSeed * 7.0 + uTime * 0.6),
+    snoise(position * 2.0 + uSeed * 13.0 + uTime * 0.6),
+    snoise(position * 2.0 + uSeed * 29.0 + uTime * 0.6));
+  p = qrot(uQuat, p);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}
+`;
+const promFrag = GLSL_COMMON + GLSL_SNOISE3 + /* glsl */`
+uniform float uLife, uSeed, uTime;
+uniform vec3 uStarColor;
+varying vec2 vUvT;
+void main(){
+  float n = 1.0 - abs(snoise(vec3(vUvT.x * 6.0 - uTime * 1.7, vUvT.y * 2.0, uSeed * 9.0)));
+  n = pow(n, 1.6);
+  float ends = smoothstep(0.0, 0.07, vUvT.x) * smoothstep(1.0, 0.93, vUvT.x);
+  float env = smoothstep(0.0, 0.12, uLife) * smoothstep(1.0, 0.92, uLife);
+  float flash = smoothstep(0.84, 0.9, uLife) * (1.0 - smoothstep(0.9, 1.0, uLife));
+  vec3 col = mix(uStarColor * 1.4, vec3(1.0, 0.96, 0.85), n * 0.3 + flash * 0.6);
+  float a = n * ends * env * (0.5 + 1.1 * flash);
+  gl_FragColor = vec4(col * a, a);
+}
+`;
+{
+  // one template arc on the unit sphere: 35 degrees of span, apex pushed out
+  const a0 = new THREE.Vector3(1, 0, 0);
+  const a1 = new THREE.Vector3(Math.cos(0.6109), 0, Math.sin(0.6109));
+  const mid = a0.clone().add(a1).normalize();
+  const apex = mid.clone().multiplyScalar(1.5);
+  const ctrl = apex.clone().multiplyScalar(2).sub(a0.clone().add(a1).multiplyScalar(0.5));
+  const curve = new THREE.QuadraticBezierCurve3(a0, ctrl, a1);
+  const tubeGeo = new THREE.TubeGeometry(curve, 80, 0.016, 8, false);
+
+  for (let i = 0; i < ARC_COUNT; i++){
+    const u = {
+      uQuat:      { value: new THREE.Vector4(0, 0, 0, 1) },
+      uLife:      { value: 1.1 },
+      uHeight:    { value: 1 },
+      uSeed:      { value: Math.random() * 10 },
+      uTime:      { value: 0 },
+      uStarColor: { value: pal.star },
+    };
+    const m = new THREE.ShaderMaterial({
+      uniforms: u, vertexShader: promVert, fragmentShader: promFrag,
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(tubeGeo, m);
+    mesh.frustumCulled = false;
+    scene.add(mesh);
+    arcSlots.push({ u, start: -99, dur: 8 });
+  }
+}
+function spawnArc(point, height = 0.55 + Math.random() * 0.35){
+  const slot = arcSlots.find(s => S.simTime - s.start > s.dur) ||
+               arcSlots.reduce((a, b) => (a.start < b.start ? a : b));
+  const roll = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.random() * Math.PI * 2);
+  const align = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(1, 0, 0), point);
+  const q = align.multiply(roll);
+  slot.u.uQuat.value.set(q.x, q.y, q.z, q.w);
+  slot.u.uHeight.value = height;
+  slot.u.uSeed.value = Math.random() * 10;
+  slot.start = S.simTime;
+  slot.dur = 6 + Math.random() * 4;
+}
+
+/* ====================================================================
+   8. BACKGROUND — starfield + nebula on a far inverted sphere
+==================================================================== */
+const bgUniforms = {
+  uTime:      { value: 0 },
+  uStarColor: { value: pal.star },
+  uWash:      { value: 0 },
+};
+const bgVert = /* glsl */`
+varying vec3 vDir;
+void main(){
+  vDir = position;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+const bgFrag = GLSL_COMMON + GLSL_SNOISE3 + /* glsl */`
+uniform float uTime, uWash;
+uniform vec3 uStarColor;
+varying vec3 vDir;
+
+float hash13(vec3 p3){ p3 = fract(p3 * 0.1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+vec3 hash33(vec3 p3){
+  p3 = fract(p3 * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yxx) * p3.zyx);
+}
+float starLayer(vec3 d, float scale, float t){
+  vec3 p = d * scale;
+  vec3 id = floor(p);
+  vec3 f = fract(p) - 0.5;
+  float h = hash13(id);
+  vec3 jit = (hash33(id) - 0.5) * 0.8;
+  float dist = length(f - jit);
+  float b = smoothstep(0.09, 0.0, dist);
+  float tw = 0.6 + 0.4 * sin(t * (1.0 + h * 3.0) + h * 40.0);
+  return b * step(0.82, h) * tw * (0.3 + h);
+}
+float fbm3(vec3 p){
+  float f = 0.0, a = 0.5;
+  for (int i = 0; i < 2; i++){ f += a * snoise(p); p *= 2.07; a *= 0.5; }
+  return f;
+}
+
+void main(){
+  vec3 d = normalize(vDir);
+  float stars = starLayer(d, 22.0, uTime) * 0.9
+              + starLayer(d + 4.1, 47.0, uTime * 0.7) * 0.55
+              + starLayer(d + 9.3, 89.0, uTime * 0.5) * 0.3;
+  float neb = fbm3(d * 2.3 + vec3(0.0, 0.0, uTime * 0.004));
+  float neb2 = fbm3(d * 5.1 + 7.0);
+  vec3 nebCol = mix(vec3(0.045, 0.02, 0.10), vec3(0.10, 0.05, 0.18), neb * 0.5 + 0.5)
+              * (0.30 + 0.25 * neb2) * 0.55;
+  vec3 col = nebCol + vec3(stars) * vec3(0.9, 0.92, 1.0);
+  col += uStarColor * uWash * (0.10 + 0.18 * (neb * 0.5 + 0.5));
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+{
+  const bg = new THREE.Mesh(
+    new THREE.SphereGeometry(55, 32, 32),
+    new THREE.ShaderMaterial({ uniforms: bgUniforms, vertexShader: bgVert, fragmentShader: bgFrag, side: THREE.BackSide, depthWrite: false })
+  );
+  bg.frustumCulled = false;
+  scene.add(bg);
+}
+
+/* ====================================================================
+   9. POST CHAIN — bloom → heat haze → god rays → grade
+==================================================================== */
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.0, 0.85, 0.85);
+composer.addPass(bloomPass);
+
+const PASS_VERT = /* glsl */`
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const hazePass = new ShaderPass({
+  uniforms: {
+    tDiffuse:  { value: null },
+    uTime:     { value: 0 },
+    uStrength: { value: 0.6 },
+    uCenter:   { value: new THREE.Vector2(0.5, 0.5) },
+    uRadius:   { value: 0.25 },
+    uAspect:   { value: 1 },
+  },
+  vertexShader: PASS_VERT,
+  fragmentShader: /* glsl */`
+uniform sampler2D tDiffuse;
+uniform float uTime, uStrength, uRadius, uAspect;
+uniform vec2 uCenter;
+varying vec2 vUv;
+float hash13(vec3 p3){ p3 = fract(p3 * 0.1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec3 p){
+  vec3 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash13(i), hash13(i + vec3(1,0,0)), f.x), mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+    mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x), mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y),
+    f.z);
+}
+void main(){
+  vec2 rel = (vUv - uCenter) * vec2(uAspect, 1.0);
+  float d = length(rel);
+  // shimmer band hugging the limb — the star face and starfield corners stay still
+  float mask = smoothstep(uRadius * 2.2, uRadius * 1.05, d) * smoothstep(uRadius * 0.72, uRadius * 1.0, d);
+  vec2 off = vec2(
+    vnoise(vec3(vUv * 5.0, uTime * 0.8)) + 0.5 * vnoise(vec3(vUv * 11.0, uTime * 1.1)),
+    vnoise(vec3(vUv * 5.0 + 31.7, uTime * 0.8)) + 0.5 * vnoise(vec3(vUv * 11.0 + 53.1, uTime * 1.1))) - 0.75;
+  gl_FragColor = texture2D(tDiffuse, vUv + off * 0.002 * uStrength * mask);
+}
+`});
+composer.addPass(hazePass);
+
+const burstPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    uCenter:  { value: new THREE.Vector2(0.5, 0.5) },
+    uFlare:   { value: 0 },
+    uTint:    { value: pal.star },
+  },
+  vertexShader: PASS_VERT,
+  fragmentShader: /* glsl */`
+uniform sampler2D tDiffuse;
+uniform vec2 uCenter;
+uniform float uFlare;
+uniform vec3 uTint;
+varying vec2 vUv;
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main(){
+  vec2 dir = vUv - uCenter;
+  vec3 acc = vec3(0.0);
+  float tw = 0.0;
+  // per-pixel jittered start turns discrete-tap rings into noise
+  vec2 uv = vUv - dir * 0.018 * 3.0 * hash12(vUv * 913.7);
+  for (int i = 0; i < 24; i++){
+    uv -= dir * 0.018;
+    float wt = exp(-float(i) * 0.18);
+    acc += max(texture2D(tDiffuse, uv).rgb - 1.1, 0.0) * wt;
+    tw += wt;
+  }
+  acc /= tw;
+  gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb + acc * uFlare * 0.55 * mix(vec3(1.0), uTint * 1.6, 0.5), 1.0);
+}
+`});
+burstPass.enabled = false;
+composer.addPass(burstPass);
+
+const gradePass = new ShaderPass({
+  uniforms: {
+    tDiffuse:   { value: null },
+    uTime:      { value: 0 },
+    uCA:        { value: 0.0015 },
+    uExposure:  { value: 1 },
+    uWarble:    { value: 0 },
+    uFlare:     { value: 0 },
+    uStarColor: { value: pal.star },
+    uAspect:    { value: 1 },
+  },
+  vertexShader: PASS_VERT,
+  fragmentShader: /* glsl */`
+uniform sampler2D tDiffuse;
+uniform float uTime, uCA, uExposure, uWarble, uFlare, uAspect;
+uniform vec3 uStarColor;
+varying vec2 vUv;
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main(){
+  vec2 cuv = vUv - 0.5;
+  cuv += sin(vec2(cuv.y, cuv.x) * 9.0 + uTime * 5.0) * 0.0023 * uWarble;
+  vec2 uv = cuv + 0.5;
+  float r2 = dot(cuv * vec2(uAspect, 1.0), cuv * vec2(uAspect, 1.0));
+  float ca = uCA * (0.4 + r2 * 2.2);
+  vec3 col;
+  col.r = texture2D(tDiffuse, uv + cuv * ca).r;
+  col.g = texture2D(tDiffuse, uv).g;
+  col.b = texture2D(tDiffuse, uv - cuv * ca).b;
+
+  // anamorphic streak on hot pixels — flares only; 16 full-res taps are not free
+  if (uFlare > 0.004){
+    vec3 streak = vec3(0.0);
+    float sw = 0.0;
+    float jit = 0.6 + 0.8 * hash12(vUv * 487.3); // de-comb the discrete taps
+    for (int i = 1; i <= 8; i++){
+      float o = float(i) * 0.008 * (1.0 + uFlare) * jit;
+      float wt = exp(-float(i) * 0.5);
+      streak += max(texture2D(tDiffuse, uv + vec2(o, 0.0)).rgb - 1.6, 0.0) * wt;
+      streak += max(texture2D(tDiffuse, uv - vec2(o, 0.0)).rgb - 1.6, 0.0) * wt;
+      sw += wt * 2.0;
+    }
+    col += (streak / sw) * mix(vec3(1.0), uStarColor * 2.0, 0.6)
+         * (0.35 + 1.2 * uFlare) * smoothstep(0.004, 0.05, uFlare);
+  }
+
+  col *= uExposure;
+  col = max(col, vec3(0.0)); // negatives through ACES invert hue
+  col = col * (2.51 * col + 0.03) / (col * (2.43 * col + 0.59) + 0.14); // ACES (Narkowicz fit)
+
+  float vig = pow(1.0 - min(r2 * 0.55, 1.0), 1.4);
+  col *= 0.35 + 0.65 * vig;
+
+  col = pow(max(col, 0.0), vec3(0.4545));
+
+  // luminance-inverse grain AFTER gamma so blacks dither gently instead of flashing
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  float gr = hash12(vUv * vec2(1920.0, 1080.0) + fract(uTime) * 941.0) - 0.5;
+  col += gr * 0.03 / (1.0 + lum * 4.0);
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`});
+composer.addPass(gradePass);
+
+/* ====================================================================
+   10. INPUT — inertial orbit, scorch, charge, detonate
+==================================================================== */
+const pointer = { down: false, dragging: false, x: 0, y: 0, downX: 0, downY: 0, downT: 0, hit: null, hover: null };
+const tmpV3 = new THREE.Vector3();
+const downScratch = new THREE.Vector3();
+const upScratch = new THREE.Vector3();
+const hoverScratch = new THREE.Vector3();
+
+function rayHitSphere(clientX, clientY, r = 1.05, target = null){
+  const px = (clientX / innerWidth) * 2 - 1;
+  const py = -(clientY / innerHeight) * 2 + 1;
+  tmpV3.set(px, py, 0.5).unproject(camera);
+  const rd = tmpV3.sub(camera.position).normalize();
+  const ro = camera.position;
+  const b = ro.dot(rd);
+  const c = ro.lengthSq() - r * r;
+  const h = b * b - c;
+  if (h < 0) return null;
+  const t = -b - Math.sqrt(h);
+  if (t < 0) return null;
+  return (target || new THREE.Vector3()).copy(ro).addScaledVector(rd, t).normalize();
+}
+
+function noteInput(){
+  S.lastInput = S.simTime;
+  if (S.cinematic){
+    S.cinematic = false;
+    S.cineKilled = performance.now();
+    document.getElementById('badge').classList.remove('on');
+  }
+}
+
+stage.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  noteInput();
+  pointer.down = true; pointer.dragging = false;
+  pointer.downX = pointer.x = e.clientX;
+  pointer.downY = pointer.y = e.clientY;
+  pointer.downT = performance.now();
+  pointer.hit = rayHitSphere(e.clientX, e.clientY, 1.05, downScratch);
+  stage.setPointerCapture(e.pointerId);
+});
+const resetPointer = () => {
+  pointer.down = false; pointer.dragging = false;
+  S.chargeHeld = false; S.charge = 0;
+};
+stage.addEventListener('pointercancel', resetPointer);
+stage.addEventListener('lostpointercapture', resetPointer);
+stage.addEventListener('pointermove', (e) => {
+  const dx = e.clientX - pointer.x, dy = e.clientY - pointer.y;
+  pointer.x = e.clientX; pointer.y = e.clientY;
+  if (pointer.down){
+    if (!pointer.dragging && Math.hypot(e.clientX - pointer.downX, e.clientY - pointer.downY) > 6){
+      pointer.dragging = true;
+      S.chargeHeld = false;
+    }
+    if (pointer.dragging){
+      noteInput();
+      orbit.vTheta = -dx * 0.0045;
+      orbit.vPhi = -dy * 0.0045;
+      orbit.theta += orbit.vTheta;
+      orbit.phi = THREE.MathUtils.clamp(orbit.phi + orbit.vPhi, 0.15, Math.PI - 0.15);
+      S.dragEnergy = Math.min(1, S.dragEnergy + Math.hypot(dx, dy) * 0.004);
+    }
+  }
+});
+stage.addEventListener('pointerup', (e) => {
+  const hit = rayHitSphere(e.clientX, e.clientY, 1.05, upScratch);
+  if (!pointer.dragging && hit){
+    if (S.charge > 0.1) detonate(hit, 1 + 1.6 * S.charge + S.activity * 0.5);
+    else detonate(hit, 1 + S.activity);
+  }
+  resetPointer();
+});
+stage.addEventListener('dblclick', (e) => {
+  if (!rayHitSphere(e.clientX, e.clientY)){
+    // noteInput() already killed cinematic on the clicks — "recently killed" means it was ON
+    const wasOn = performance.now() - S.cineKilled < 600;
+    S.cinematic = !wasOn;
+    S.cineT = 0;
+    document.getElementById('badge').classList.toggle('on', S.cinematic);
+  }
+});
+stage.addEventListener('wheel', (e) => {
+  noteInput();
+  orbit.targetRadius = THREE.MathUtils.clamp(orbit.targetRadius * Math.exp(e.deltaY * 0.0012), 1.6, 6);
+}, { passive: true });
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space'){
+    e.preventDefault();
+    noteInput();
+    if (S.simTime - S.lastFlare > 3){
+      detonate(visiblePoint(), 1.6 + S.activity);
+    }
+  } else if (e.key === '1' || e.key === '2' || e.key === '3'){
+    pal.target = Number(e.key) - 1;
+  } else if (e.key === 'h'){
+    document.getElementById('hud-root').classList.toggle('hidden');
+  }
+});
+
+function visiblePoint(){
+  const toCam = camera.position.clone().normalize();
+  const p = new THREE.Vector3().randomDirection();
+  const d = p.dot(toCam);
+  if (d < 0) p.addScaledVector(toCam, -2 * d);            // mirror to the visible hemisphere
+  if (p.dot(toCam) < 0.15) p.addScaledVector(toCam, 0.3); // nudge off the limb
+  return p.normalize();
+}
+
+/* ====================================================================
+   11. EVENT DIRECTOR — detonations, fissures, heat, autopilot
+==================================================================== */
+function detonate(point, mag){
+  const slot = shockSlots.reduce((a, b) => (a.w > b.w ? a : b));
+  slot.set(point.x, point.y, point.z, 0);
+
+  S.flareAmp = Math.max(S.flareAmp, 0.6 + 0.4 * Math.min(mag, 2));
+  S.flareT = 0;
+  S.lastFlare = S.simTime;
+  S.caKick = 1;
+  S.shakeAmp = Math.max(S.shakeAmp, 0.035 * mag);
+  S.washDelay = 0.3;
+  S.washAmp = 0.4 * Math.min(mag, 2);
+
+  emberUniforms.uBurst.value.set(point.x, point.y, point.z, S.simTime);
+  emberUniforms.uBurstFrac.value = Math.min(0.08 + 0.07 * mag, 0.3);
+
+  spawnArc(point, 0.6 + 0.25 * Math.min(mag, 2));
+  if (mag > 1.5) S.slowmoHold = 0.55; // big ones hit in slow motion
+}
+
+function touchHeat(pt, target, dt){
+  let best = -1, bd = 1e9;
+  heatPts.forEach((h, i) => { const d = h.pos.distanceTo(pt); if (d < bd){ bd = d; best = i; } });
+  if (bd > 0.3){
+    best = heatPts.reduce((mi, h, i, arr) => (h.str < arr[mi].str ? i : mi), 0);
+    heatPts[best].pos.copy(pt);
+    heatPts[best].str *= 0.3;
+  } else {
+    heatPts[best].pos.lerp(pt, 0.3);
+  }
+  heatPts[best].str = Math.min(target, heatPts[best].str + dt / 0.8);
+  return best;
+}
+
+const ghostPt = new THREE.Vector3(0, 0, 1);
+const ghostToCam = new THREE.Vector3();
+function updateDirector(dt, rawDt){
+  const t = S.simTime;
+
+  // ---- activity: slow swell + rare spikes + agitation + 80s drift layer
+  const drift = Math.sin(t * 0.0785 + 0.9); // ~80s, incommensurate with the 45s cycle
+  S.activity = THREE.MathUtils.clamp(
+    0.55 + 0.25 * Math.sin(t * 0.14) + 0.2 * Math.pow(Math.max(0, Math.sin(t * 0.037 + 2.1)), 3)
+    + 0.3 * S.dragEnergy + 0.25 * S.charge + 0.05 * drift, 0, 1.15);
+  S.dragEnergy *= Math.pow(0.92, rawDt * 60);
+
+  // ---- auto CME when activity spikes
+  if (S.birth >= 1 && S.activity > 0.88 && t - S.lastFlare > 7){
+    detonate(visiblePoint(), 1 + S.activity);
+  }
+
+  // ---- flare envelope
+  S.flareT += dt;
+  S.flareEnv = S.flareAmp * (S.flareT < 0.25 ? S.flareT / 0.25 : Math.exp(-(S.flareT - 0.25) * 2.2));
+  if (S.flareEnv < 0.01 && S.flareT > 1) S.flareAmp = 0;
+
+  // ---- shock ages
+  for (const s of shockSlots) if (s.w < 90) s.w += dt;
+
+  // ---- delayed light wash over the nebula
+  if (S.washDelay >= 0){
+    S.washDelay -= dt;
+    if (S.washDelay < 0) S.wash = S.washAmp;
+  }
+  S.wash = Math.max(0, S.wash - dt * 0.5);
+
+  // ---- charge (press-and-hold on the surface)
+  if (pointer.down && !pointer.dragging && pointer.hit && (performance.now() - pointer.downT) > 250){
+    S.chargeHeld = true;
+    S.charge = Math.min(1, S.charge + rawDt / 1.4);
+    touchHeat(pointer.hit, 1.2, dt);
+  } else if (!pointer.down){
+    S.chargeHeld = false;
+  }
+
+  // ---- hover scorch
+  if (!pointer.down && S.birth >= 1){
+    pointer.hover = rayHitSphere(pointer.x, pointer.y, 1.05, hoverScratch);
+    if (pointer.hover) touchHeat(pointer.hover, 1, dt);
+  }
+  for (const h of heatPts) h.str = Math.max(0, h.str - dt / 4);
+
+  // ---- idle → cinematic + ghost-stir
+  const idleFor = t - S.lastInput;
+  if (!S.cinematic && idleFor > 15 && S.birth >= 1){
+    S.cinematic = true; S.cineT = 0;
+    document.getElementById('badge').classList.add('on');
+  }
+  const ghostTarget = (S.cinematic && S.birth >= 1) ? 1 : 0;
+  S.ghost += (ghostTarget - S.ghost) * Math.min(1, rawDt / 0.8);
+  if (S.ghost > 0.05){
+    ghostPt.set(
+      Math.sin(t * 0.13 + 1.7),
+      Math.sin(t * 0.097 + 4.2) * 0.6,
+      Math.cos(t * 0.151)).normalize();
+    ghostToCam.copy(camera.position).normalize();
+    const gd = ghostPt.dot(ghostToCam);
+    if (gd < 0) ghostPt.addScaledVector(ghostToCam, -2 * gd).normalize();
+    touchHeat(ghostPt, 0.55 * S.ghost, dt);
+  }
+  if (S.cinematic){
+    S.cineT += dt;
+    orbit.theta += 0.05 * dt;
+    orbit.phi = THREE.MathUtils.clamp(orbit.phi + Math.sin(S.cineT * 0.11) * 0.0004, 0.3, Math.PI - 0.3);
+    orbit.targetRadius = 2.9 + Math.sin(S.cineT * 0.08) * 0.55; // slow dolly: 2.35 → 3.45
+  }
+
+  // ---- great-circle fissure: the idle scene tells a story
+  if (S.birth >= 1 && t > S.fissureNext){
+    S.fissureT = t;
+    S.fissureNext = t + 26 + Math.random() * 14;
+    S.fissureN.randomDirection();
+    S.fissureR.randomDirection().cross(S.fissureN);
+    if (S.fissureR.lengthSq() < 1e-6) S.fissureR.set(0, 1, 0).cross(S.fissureN);
+    if (S.fissureR.lengthSq() < 1e-6) S.fissureR.set(1, 0, 0).cross(S.fissureN);
+    S.fissureR.normalize();
+  }
+  const ft = t - S.fissureT;
+  let fProg = 0, fGlow = 0;
+  if (ft >= 0 && ft < 9){
+    fProg = Math.min(1, ft / 3);
+    fGlow = ft < 3 ? Math.min(1, ft * 2) : Math.exp(-(ft - 3) * 0.9);
+  }
+  starUniforms.uFissure.value.set(S.fissureN.x, S.fissureN.y, S.fissureN.z, fProg);
+  starUniforms.uFissureRef.value.set(S.fissureR.x, S.fissureR.y, S.fissureR.z, fGlow);
+
+  // ---- random ambient prominences
+  if (S.birth >= 1 && Math.random() < dt * (0.04 + 0.12 * S.activity)){
+    spawnArc(visiblePoint());
+  }
+
+  // ---- palette easing
+  const P = PALETTES[pal.target];
+  const pk = Math.min(1, rawDt * 2.5);
+  for (let i = 0; i < 9; i++) pal.hue[i] += (P.hue[i] - pal.hue[i]) * pk;
+  starUniforms.uHue.value.set(...pal.hue);
+  pal.star.lerp(P.star, pk);
+  pal.crust.lerp(P.crust, pk);
+}
+
+/* ====================================================================
+   12. ADAPTIVE QUALITY LADDER (hysteresis, never flaps)
+==================================================================== */
+const quality = { level: 0, frames: [], cool: 0, goodTime: 0 };
+// dpr is read live (monitor moves, zoom) and clamped per level so "degrading"
+// can never render MORE pixels than the level above it
+const QL = [
+  { dpr: () => Math.min(devicePixelRatio, 2),    corona: 4, haze: true },
+  { dpr: () => Math.min(devicePixelRatio, 1.5),  corona: 4, haze: true },
+  { dpr: () => Math.min(devicePixelRatio, 1.5),  corona: 3, haze: true },
+  { dpr: () => Math.min(devicePixelRatio, 1.25), corona: 3, haze: false },
+];
+function applyQuality(){
+  const q = QL[quality.level];
+  const dpr = q.dpr();
+  renderer.setPixelRatio(dpr);
+  composer.setPixelRatio(dpr);
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  coronaUniforms.uSamples.value = q.corona;
+  hazePass.enabled = q.haze;
+  emberUniforms.uSizeBase.value = 4.5 * dpr;
+  document.getElementById('ql').textContent = 'Q' + quality.level;
+}
+// fed with the rAF-to-rAF delta: composer.render() returns after CPU encode,
+// so timing it directly is blind to GPU-bound frames
+function updateQuality(frameMs, rawDt){
+  if (S.simTime < 2){ quality.frames.length = 0; return; } // ignore shader-compile spikes at boot
+  quality.frames.push(frameMs);
+  if (quality.frames.length > 40) quality.frames.shift();
+  quality.cool -= rawDt;
+  if (quality.frames.length < 40 || quality.cool > 0) return;
+  const avg = quality.frames.reduce((a, b) => a + b, 0) / quality.frames.length;
+  if (avg > 19 && quality.level < QL.length - 1){
+    quality.level++;
+    quality.cool = 2;
+    quality.goodTime = 0;
+    applyQuality();
+  } else if (avg < 10 && quality.level > 0){ // < trigger / 1.78 so Q0<->Q1 can't pump
+    quality.goodTime += rawDt;
+    if (quality.goodTime > 4){
+      quality.level--;
+      quality.cool = 2;
+      quality.goodTime = 0;
+      applyQuality();
+    }
+  } else {
+    quality.goodTime = 0;
+  }
+}
+
+/* ====================================================================
+   13. FRAME LOOP
+==================================================================== */
+const clock = new THREE.Clock();
+const starNDC = new THREE.Vector3();
+let fpsAccum = 0, fpsFrames = 0, fpsTimer = 0;
+let hudDimTimer = 0;
+
+function frame(){
+  requestAnimationFrame(frame);
+  step(Math.min(clock.getDelta(), 0.05));
+}
+
+function step(rawDt){
+
+  // slow-mo: big detonations bend time
+  if (S.slowmoHold > 0){
+    S.slowmoHold -= rawDt;
+    S.timescale += (0.25 - S.timescale) * Math.min(1, rawDt * 10);
+  } else {
+    S.timescale += (1 - S.timescale) * Math.min(1, rawDt * 2.5);
+  }
+  const dt = rawDt * S.timescale;
+  S.simTime += dt;
+
+  // birth sequence
+  if (S.birth < 1) S.birth = Math.min(1, S.simTime / 3.2);
+  const chaos = 1 + 0.8 * (1 - S.birth);
+
+  updateDirector(dt, rawDt);
+
+  // ---- camera: inertial orbit + cinematic + shake
+  if (!pointer.dragging){
+    orbit.theta += orbit.vTheta;
+    orbit.phi = THREE.MathUtils.clamp(orbit.phi + orbit.vPhi, 0.15, Math.PI - 0.15);
+    orbit.vTheta *= Math.pow(0.95, rawDt * 60);
+    orbit.vPhi *= Math.pow(0.95, rawDt * 60);
+    orbit.theta += 0.02 * dt * (0.5 + S.activity); // idle drift — never static
+  }
+  orbit.radius += (orbit.targetRadius - orbit.radius) * Math.min(1, rawDt * 4);
+  camera.position.setFromSphericalCoords(orbit.radius, orbit.phi, orbit.theta);
+  S.shakeAmp *= Math.exp(-4 * rawDt);
+  if (S.shakeAmp > 0.0005){
+    const ts = S.simTime * 31;
+    camera.position.x += Math.sin(ts * 1.3) * S.shakeAmp;
+    camera.position.y += Math.sin(ts * 1.7 + 2.0) * S.shakeAmp;
+    camera.position.z += Math.sin(ts * 1.1 + 4.0) * S.shakeAmp;
+  }
+  camera.lookAt(0, 0, 0);
+  camera.updateMatrixWorld(); // refresh matrixWorldInverse NOW — .project() below must not lag a frame
+
+  // ---- push uniforms
+  const act = S.activity;
+  const close = 1 - THREE.MathUtils.clamp((orbit.radius - 1.7) / (2.6 - 1.7), 0, 1);
+
+  starUniforms.uTime.value = S.simTime;
+  starUniforms.uActivity.value = act;
+  starUniforms.uFlare.value = S.flareEnv;
+  starUniforms.uAmp.value = 0.085 * (0.8 + 0.4 * act) * chaos;
+  starUniforms.uBreath.value = (1 - 0.35 * S.charge) * chaos;
+  starUniforms.uDriftZ.value = 0.12 * Math.max(0, act - 0.75) / 0.4 + 0.02 * Math.sin(S.simTime * 0.0785);
+  starUniforms.uIgnite.value.w = S.birth >= 1 ? 99 : S.birth * 3.6;
+  for (let i = 0; i < 4; i++){
+    starUniforms.uHeat.value[i].set(heatPts[i].pos.x, heatPts[i].pos.y, heatPts[i].pos.z, heatPts[i].str);
+  }
+
+  coronaUniforms.uTime.value = S.simTime;
+  coronaUniforms.uActivity.value = act;
+  coronaUniforms.uBirth.value = S.birth;
+  coronaUniforms.uFlare.value = S.flareEnv;
+
+  emberUniforms.uTime.value = S.simTime;
+  emberUniforms.uBirth.value = S.birth;
+  emberUniforms.uActivity.value = act;
+
+  for (const a of arcSlots){
+    a.u.uTime.value = S.simTime;
+    a.u.uLife.value = THREE.MathUtils.clamp((S.simTime - a.start) / a.dur, 0, 1.1);
+  }
+
+  bgUniforms.uTime.value = S.simTime;
+  bgUniforms.uWash.value = S.wash;
+
+  // star screen position + radius for the post passes
+  starNDC.set(0, 0, 0).project(camera);
+  const cx = (starNDC.x + 1) / 2, cy = (starNDC.y + 1) / 2;
+  const dist = camera.position.length();
+  const uvR = (1.3 / (dist * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)))) * 0.5;
+
+  bloomPass.strength = Math.min(1.5, (0.55 + 0.55 * act) * (1 + 0.25 * S.charge) + S.flareEnv * 0.25 + 0.25 * (1 - S.birth));
+
+  hazePass.uniforms.uTime.value = S.simTime;
+  hazePass.uniforms.uCenter.value.set(cx, cy);
+  hazePass.uniforms.uRadius.value = uvR;
+  hazePass.uniforms.uAspect.value = innerWidth / innerHeight;
+  hazePass.uniforms.uStrength.value = (0.5 + 1.2 * act) * (1 + 1.2 * close);
+
+  burstPass.enabled = S.flareEnv > 0.01;
+  burstPass.uniforms.uCenter.value.set(cx, cy);
+  burstPass.uniforms.uFlare.value = S.flareEnv;
+  // ShaderPass clones its uniforms, so live palette references are severed — sync by copy
+  burstPass.uniforms.uTint.value.copy(pal.star);
+  gradePass.uniforms.uStarColor.value.copy(pal.star);
+
+  S.caKick *= Math.exp(-3.5 * rawDt);
+  gradePass.uniforms.uTime.value = S.simTime;
+  gradePass.uniforms.uCA.value = 0.0015 + 0.0105 * S.caKick * S.flareEnv + 0.002 * close;
+  gradePass.uniforms.uExposure.value = 1 + 0.12 * close + (S.cinematic ? 0.07 : 0);
+  gradePass.uniforms.uWarble.value = close + S.flareEnv * 0.3;
+  gradePass.uniforms.uFlare.value = S.flareEnv;
+  gradePass.uniforms.uAspect.value = innerWidth / innerHeight;
+
+  composer.render();
+  updateQuality(rawDt * 1000, rawDt);
+
+  // fps hud
+  fpsAccum += rawDt; fpsFrames++; fpsTimer += rawDt;
+  if (fpsTimer > 0.5){
+    document.getElementById('fps').textContent = Math.round(fpsFrames / fpsAccum);
+    fpsAccum = 0; fpsFrames = 0; fpsTimer = 0;
+  }
+  // hud auto-dim
+  hudDimTimer = (S.simTime - S.lastInput > 8) ? hudDimTimer + rawDt : 0;
+  document.getElementById('hud-root').classList.toggle('dim', hudDimTimer > 1);
+}
+
+/* ====================================================================
+   14. BOOT — warm up shaders behind black, then ignite
+==================================================================== */
+function resize(){
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  applyQuality();
+}
+window.addEventListener('resize', resize);
+
+applyQuality();
+burstPass.enabled = true; // warm-compile the flare shader too — first detonation must not hitch
+composer.render();        // compile + first frame while the canvas is still transparent
+burstPass.enabled = false;
+booted = true;
+let ignited = false;
+function ignite(){
+  if (ignited) return;
+  ignited = true;
+  stage.classList.add('lit');
+  document.getElementById('boot').classList.add('off');
+  clock.start();
+  frame();
+}
+requestAnimationFrame(ignite);
+setTimeout(ignite, 800); // backgrounded tabs never get the rAF — don't stay black
+
+console.log('%cHELIOS FURY%c — orbit of a dying star', 'color:#ff6b1a;font-weight:bold;letter-spacing:0.3em', 'color:#8a6f58');
+window.HELIOS = { S, orbit, quality, pal, step, detonate, bloomPass, hazePass, burstPass, gradePass, THREE }; // debug handle
+</script>
+</body>
+</html>
