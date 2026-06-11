@@ -2,13 +2,13 @@
 
 **Live demo: https://fable-5-sphere-test.vercel.app**
 
-I'm Claude (the Fable 5 model). A human gave me an empty folder and this prompt:
+The agent (Claude, Fable 5 model) was given an empty folder and this prompt:
 
 > i only have an empty folder. i want to make the sickest 3d sphere render possible, like with shaders, and super cool animations. use any libraries, any programming languages you want.
 >
 > go hard. extremely hard
 
-Everything in this repo — the concept, the code, the debugging, the visual tuning — is my output from that one prompt.
+Everything in this repo — the concept, the code, the debugging, the visual tuning — is the agent's output from that one prompt.
 
 ## What it is
 
@@ -21,12 +21,12 @@ Everything in this repo — the concept, the code, the debugging, the visual tun
 
 **Interact:** hover scorches a welt into the crust · click detonates a CME at that point · press-and-hold charges a bigger one · drag fast to agitate the star · scroll all the way in · `space` forces a flare · `1·2·3` switches star class · idle 15s and it flies itself.
 
-## How I built it
+## How the agent built it
 
-1. **Concept panel.** I spawned three designer subagents (molten star / liquid-metal orb / crystal reactor) and three judge agents to score them. HELIOS FURY won; I grafted the best ideas from the losers (birth ignition, hold-to-charge, slow-mo kicks) onto it.
-2. **Implementation.** One pass, one file, by me.
-3. **Adversarial review.** Four reviewer agents (GLSL correctness, three.js API, runtime logic, visuals/perf) with verifier agents double-checking every finding. They confirmed 5 serious bugs — the best one: my cosine palette went *negative* mid-ramp, and negative HDR through ACES tone mapping inverts into cyan, turning lava veins blue. All 21 findings fixed.
-4. **Looking at it.** I drove the simulation deterministically in a headless browser and screenshot-verified every beat — idle, peak detonation, close dolly, all three palettes — through about six rounds of tuning. The first render was a total whiteout; what shipped is the version I'd grab someone to look at.
+1. **Concept panel.** It spawned three designer subagents (molten star / liquid-metal orb / crystal reactor) and three judge agents to score them. HELIOS FURY won; the best ideas from the losers (birth ignition, hold-to-charge, slow-mo kicks) were grafted onto it.
+2. **Implementation.** One pass, one file.
+3. **Adversarial review.** Four reviewer agents (GLSL correctness, three.js API, runtime logic, visuals/perf) with verifier agents double-checking every finding. They confirmed 5 serious bugs — the best one: the cosine palette went *negative* mid-ramp, and negative HDR through ACES tone mapping inverts into cyan, turning lava veins blue. All 21 findings fixed.
+4. **Looking at it.** The agent drove the simulation deterministically in a headless browser and screenshot-verified every beat — idle, peak detonation, close dolly, all three palettes — through about six rounds of tuning. The first render was a total whiteout; what shipped is the version worth grabbing someone to look at.
 
 ## Run locally
 
